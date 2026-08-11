@@ -1,0 +1,49 @@
+services:
+  jenkins:
+    build:
+      context: .
+      args:
+        JENKINS_IMAGE: ${JENKINS_IMAGE:-__JENKINS_IMAGE__}
+    image: local/jenkins-controller:__PLAN_SHORT__
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      CASC_JENKINS_CONFIG: /var/jenkins_home/casc_configs/jenkins.yaml
+      JAVA_OPTS: -Djenkins.install.runSetupWizard=false
+    ports:
+      - "127.0.0.1:${JENKINS_HTTP_PORT:-__JENKINS_PORT__}:8080"
+    volumes:
+      - jenkins_home:/var/jenkins_home
+      - ./casc:/var/jenkins_home/casc_configs:ro
+      - ./secrets:/run/secrets:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/login >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 40
+      start_period: 45s
+
+  agent:
+    build:
+      context: .
+      dockerfile: Agent.Dockerfile
+      args:
+        JENKINS_AGENT_IMAGE: ${JENKINS_AGENT_IMAGE:-__JENKINS_AGENT_IMAGE__}
+    image: local/jenkins-agent:__PLAN_SHORT__
+    restart: unless-stopped
+    environment:
+      JENKINS_AGENT_SSH_PUBKEY: ${JENKINS_AGENT_SSH_PUBKEY:?set by the approved installer}
+    expose:
+      - "22"
+    volumes:
+      - agent_home:/home/jenkins/agent
+      - ./known_hosts:/home/jenkins/.ssh/known_hosts:ro
+      - ./secrets/agent_host_ed25519:/etc/ssh/ssh_host_ed25519_key:ro
+      - ./secrets/agent_host_ed25519.pub:/etc/ssh/ssh_host_ed25519_key.pub:ro
+
+volumes:
+  jenkins_home:
+    name: jenkins-home-__PLAN_SHORT__
+  agent_home:
+    name: jenkins-agent-home-__PLAN_SHORT__

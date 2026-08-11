@@ -1,0 +1,70 @@
+jenkins:
+  systemMessage: "Managed from a reviewed Jenkins delivery plan (__PLAN_ID__)"
+  numExecutors: __EXECUTORS__
+  mode: NORMAL
+  securityRealm:
+    local:
+      allowsSignup: false
+      users:
+        - id: "${JENKINS_ADMIN_ID}"
+          password: "${readFile:/run/secrets/admin_password}"
+        - id: "${JENKINS_TRIGGER_ID}"
+          password: "${readFile:/run/secrets/trigger_password}"
+  authorizationStrategy:
+    globalMatrix:
+      entries:
+        - user:
+            name: "${JENKINS_ADMIN_ID}"
+            permissions:
+              - "Overall/Administer"
+        - user:
+            name: "${JENKINS_TRIGGER_ID}"
+            permissions:
+              - "Overall/Read"
+              - "Job/Read"
+              - "Job/Build"
+  crumbIssuer:
+    standard:
+      excludeClientIPFromCrumb: false
+  globalNodeProperties:
+    - envVars:
+        env:
+          - key: "JENKINS_MANAGED_PLAN"
+            value: "__PLAN_ID__"
+  nodes:
+    - permanent:
+        name: "jenkins-agent"
+        remoteFS: "/home/jenkins/agent"
+        numExecutors: 1
+        labelString: "__AGENT_LABEL__"
+        mode: EXCLUSIVE
+        retentionStrategy: "always"
+        launcher:
+          ssh:
+            host: "agent"
+            port: 22
+            credentialsId: "jenkins-agent-ssh"
+            javaPath: ""
+            jvmOptions: ""
+            launchTimeoutSeconds: 60
+            maxNumRetries: 10
+            retryWaitTime: 15
+            sshHostKeyVerificationStrategy:
+              manuallyProvidedKeyVerificationStrategy:
+                key: "${readFile:/run/secrets/agent_host_ed25519.pub}"
+credentials:
+  system:
+    domainCredentials:
+      - credentials:
+          - basicSSHUserPrivateKey:
+              scope: SYSTEM
+              id: "jenkins-agent-ssh"
+              username: "jenkins"
+              description: "Managed build agent key for plan __PLAN_ID__"
+              privateKeySource:
+                directEntry:
+                  privateKey: "${readFile:/run/secrets/agent_ed25519}"
+__OPTIONAL_CREDENTIALS__
+unclassified:
+  location:
+    url: "__JENKINS_URL__/"

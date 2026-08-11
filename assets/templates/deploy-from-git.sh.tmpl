@@ -1,0 +1,388 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+umask 027
+PROJECT_NAME=__PROJECT_NAME__
+REPOSITORY_URL=__REPOSITORY_URL__
+LOCK_FILE=__LOCK_FILE__
+TEST_BRANCH=__TEST_BRANCH__
+PRODUCTION_BRANCH=__PRODUCTION_BRANCH__
+TEST_SOURCE_ROOT=__TEST_SOURCE_ROOT__
+PRODUCTION_SOURCE_ROOT=__PRODUCTION_SOURCE_ROOT__
+TEST_DEPLOY_ROOT=__TEST_DEPLOY_ROOT__
+PRODUCTION_DEPLOY_ROOT=__PRODUCTION_DEPLOY_ROOT__
+INSTALL_COMMAND=__INSTALL_COMMAND__
+LINT_COMMAND=__LINT_COMMAND__
+TEST_COMMAND=__TEST_COMMAND__
+BUILD_COMMAND=__BUILD_COMMAND__
+ACTIVATE_TEST_COMMAND=__ACTIVATE_TEST_COMMAND__
+ACTIVATE_PRODUCTION_COMMAND=__ACTIVATE_PRODUCTION_COMMAND__
+TEST_HEALTH_URL=__TEST_HEALTH_URL__
+PRODUCTION_HEALTH_URL=__PRODUCTION_HEALTH_URL__
+RELEASE_RETENTION=__RELEASE_RETENTION__
+ARTIFACT_PATHS=(
+__ARTIFACT_PATHS__
+)
+CLEAN_EXCLUDES=(
+__CLEAN_EXCLUDES__
+)
+
+fail() {
+  printf 'ERROR: %s\n' "$*" >&2
+  exit 2
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || fail "required command is unavailable: $1"
+}
+
+require_integer() {
+  value="$1"
+  label="$2"
+  minimum="$3"
+  maximum="$4"
+  case "$value" in ''|*[!0-9]*) fail "$label must be an integer" ;; esac
+  [ "$value" -ge "$minimum" ] && [ "$value" -le "$maximum" ] || \
+    fail "$label must be between $minimum and $maximum"
+}
+
+for required_command in git flock curl python3; do
+  require_command "$required_command"
+done
+
+: "${DEPLOY_ENV:?DEPLOY_ENV is required}"
+: "${GIT_REF:?GIT_REF is required}"
+: "${EXPECTED_COMMIT:?EXPECTED_COMMIT is required}"
+case "$EXPECTED_COMMIT" in *[!0-9a-fA-F]*|'') fail 'EXPECTED_COMMIT must be hexadecimal' ;; esac
+[ "${#EXPECTED_COMMIT}" -eq 40 ] || fail 'EXPECTED_COMMIT must contain exactly 40 hexadecimal characters'
+
+case "$DEPLOY_ENV" in
+  test)
+    expected_branch="$TEST_BRANCH"
+    SOURCE_ROOT="$TEST_SOURCE_ROOT"
+    DEPLOY_ROOT="$TEST_DEPLOY_ROOT"
+    HEALTH_URL="$TEST_HEALTH_URL"
+    ACTIVATE_COMMAND="$ACTIVATE_TEST_COMMAND"
+    ;;
+  production)
+    expected_branch="$PRODUCTION_BRANCH"
+    SOURCE_ROOT="$PRODUCTION_SOURCE_ROOT"
+    DEPLOY_ROOT="$PRODUCTION_DEPLOY_ROOT"
+    HEALTH_URL="$PRODUCTION_HEALTH_URL"
+    ACTIVATE_COMMAND="$ACTIVATE_PRODUCTION_COMMAND"
+    ;;
+  *) fail 'DEPLOY_ENV must be test or production' ;;
+esac
+[ "$GIT_REF" = "$expected_branch" ] || \
+  fail "$DEPLOY_ENV deployment requires branch $expected_branch, got $GIT_REF"
+
+python3 - "$SOURCE_ROOT" "$DEPLOY_ROOT" <<'PY'
+import pathlib
+import sys
+
+source = pathlib.Path(sys.argv[1])
+deploy = pathlib.Path(sys.argv[2])
+home = pathlib.Path.home().resolve()
+for label, path in (("source", source), ("deployment", deploy)):
+    if not path.is_absolute():
+        raise SystemExit(f"ERROR: {label} root must be absolute")
+    resolved = path.resolve(strict=False)
+    if resolved in (pathlib.Path("/"), home):
+        raise SystemExit(f"ERROR: unsafe {label} root: {resolved}")
+if source.resolve(strict=False) == deploy.resolve(strict=False):
+    raise SystemExit("ERROR: source and deployment roots must be different")
+for parent, child in ((source.resolve(strict=False), deploy.resolve(strict=False)),
+                      (deploy.resolve(strict=False), source.resolve(strict=False))):
+    try:
+        child.relative_to(parent)
+    except ValueError:
+        continue
+    raise SystemExit(f"ERROR: source and deployment roots must not be nested: {parent} contains {child}")
+PY
+
+health_attempts="${JENKINS_DEPLOY_HEALTH_ATTEMPTS:-12}"
+health_interval="${JENKINS_DEPLOY_HEALTH_INTERVAL_SECONDS:-5}"
+lock_timeout="${JENKINS_DEPLOY_LOCK_TIMEOUT_SECONDS:-2400}"
+require_integer "$health_attempts" JENKINS_DEPLOY_HEALTH_ATTEMPTS 1 60
+require_integer "$health_interval" JENKINS_DEPLOY_HEALTH_INTERVAL_SECONDS 1 60
+require_integer "$lock_timeout" JENKINS_DEPLOY_LOCK_TIMEOUT_SECONDS 1 7200
+
+mkdir -p "$(dirname -- "$LOCK_FILE")"
+exec 9>"$LOCK_FILE"
+flock -w "$lock_timeout" 9 || fail "another $PROJECT_NAME deployment still owns the lock"
+
+mkdir -p "$(dirname -- "$SOURCE_ROOT")" "$DEPLOY_ROOT/releases"
+RELEASES_DIR="$DEPLOY_ROOT/releases"
+
+validate_existing_release_state() {
+  current_path="$DEPLOY_ROOT/current"
+  python3 - "$RELEASES_DIR" <<'PY'
+import pathlib
+import sys
+
+releases = pathlib.Path(sys.argv[1])
+for child in releases.iterdir():
+    if child.is_symlink():
+        raise SystemExit(f"ERROR: release root contains a symbolic link: {child.name}")
+PY
+  if [ -e "$current_path" ] || [ -L "$current_path" ]; then
+    [ -L "$current_path" ] || fail 'current release path must be a symbolic link'
+    current_target="$(readlink "$current_path")"
+    case "$current_target" in
+      releases/*) current_name="${current_target#releases/}" ;;
+      *) fail 'current release link has an unsafe target' ;;
+    esac
+    case "$current_name" in ''|*[!A-Za-z0-9._-]*|*/*|.*) fail 'current release link has an unsafe target' ;; esac
+    [ -d "$RELEASES_DIR/$current_name" ] && [ ! -L "$RELEASES_DIR/$current_name" ] || \
+      fail 'current release link does not resolve to a regular release directory'
+    [ -f "$RELEASES_DIR/$current_name/.successful" ] || \
+      fail 'current release is not marked successful'
+  fi
+}
+
+validate_existing_release_state
+stage_dir=''
+cleanup_stage() {
+  status="$1"
+  trap - EXIT HUP INT TERM
+  if [ -n "$stage_dir" ] && [ -e "$stage_dir" ]; then
+    case "$stage_dir" in
+      "$RELEASES_DIR"/.*.staging.*) find "$stage_dir" -depth -delete ;;
+      *) printf 'Refusing to remove unexpected staging path: %s\n' "$stage_dir" >&2 ;;
+    esac
+  fi
+  exit "$status"
+}
+trap 'cleanup_stage $?' EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+if [ ! -d "$SOURCE_ROOT/.git" ]; then
+  if [ -e "$SOURCE_ROOT" ] && [ -n "$(find "$SOURCE_ROOT" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]; then
+    fail "source root exists but is not an empty Git worktree: $SOURCE_ROOT"
+  fi
+  git clone --no-checkout -- "$REPOSITORY_URL" "$SOURCE_ROOT"
+fi
+[ "$(git -C "$SOURCE_ROOT" remote get-url origin)" = "$REPOSITORY_URL" ] || \
+  fail 'existing source worktree origin does not match the configured repository'
+
+fetch_complete='false'
+for attempt in 1 2 3; do
+  if git -C "$SOURCE_ROOT" fetch --prune origin "refs/heads/$GIT_REF"; then
+    fetch_complete='true'
+    break
+  fi
+  [ "$attempt" -eq 3 ] || sleep "$attempt"
+done
+[ "$fetch_complete" = 'true' ] || fail "could not fetch origin/$GIT_REF after three attempts"
+remote_commit="$(git -C "$SOURCE_ROOT" rev-parse 'FETCH_HEAD^{commit}')"
+[ "$remote_commit" = "$EXPECTED_COMMIT" ] || \
+  fail "origin/$GIT_REF resolved to $remote_commit instead of requested commit $EXPECTED_COMMIT"
+
+git -C "$SOURCE_ROOT" reset --hard "$EXPECTED_COMMIT"
+clean_arguments=(-f -d)
+for exclude in "${CLEAN_EXCLUDES[@]+"${CLEAN_EXCLUDES[@]}"}"; do
+  clean_arguments+=("-e" "$exclude")
+done
+git -C "$SOURCE_ROOT" clean "${clean_arguments[@]}"
+[ "$(git -C "$SOURCE_ROOT" rev-parse HEAD)" = "$EXPECTED_COMMIT" ] || \
+  fail 'checked-out commit changed unexpectedly'
+
+export DEPLOY_ENV GIT_REF EXPECTED_COMMIT SOURCE_ROOT DEPLOY_ROOT HEALTH_URL
+run_phase() {
+  phase="$1"
+  command_text="$2"
+  if [ -z "$command_text" ]; then
+    printf 'Skipping optional %s phase.\n' "$phase"
+    return 0
+  fi
+  printf 'Running %s phase.\n' "$phase"
+  (cd "$SOURCE_ROOT" && bash -c "$command_text")
+}
+
+run_phase install "$INSTALL_COMMAND"
+run_phase lint "$LINT_COMMAND"
+run_phase test "$TEST_COMMAND"
+run_phase build "$BUILD_COMMAND"
+
+build_identifier="${BUILD_NUMBER:-manual}"
+case "$build_identifier" in *[!A-Za-z0-9._-]*|'') fail 'BUILD_NUMBER contains unsupported characters' ;; esac
+release_id="build-${build_identifier}-${EXPECTED_COMMIT:0:12}"
+release_dir="$RELEASES_DIR/$release_id"
+[ ! -e "$release_dir" ] || fail "release already exists: $release_id"
+stage_dir="$RELEASES_DIR/.${release_id}.staging.$$"
+mkdir "$stage_dir"
+: >"$stage_dir/.jenkins-managed-release"
+
+shopt -s nullglob
+artifact_count=0
+for pattern in "${ARTIFACT_PATHS[@]}"; do
+  matches=( "$SOURCE_ROOT"/$pattern )
+  [ "${#matches[@]}" -gt 0 ] || fail "artifact pattern matched nothing: $pattern"
+  for candidate in "${matches[@]}"; do
+    relative="${candidate#"$SOURCE_ROOT"/}"
+    [ "$relative" != "$candidate" ] || fail "artifact escaped source root: $candidate"
+    [ ! -L "$candidate" ] || fail "artifact must not be a symbolic link: $relative"
+    python3 - "$SOURCE_ROOT" "$candidate" <<'PY'
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1]).resolve()
+candidate = pathlib.Path(sys.argv[2]).resolve(strict=True)
+try:
+    candidate.relative_to(root)
+except ValueError:
+    raise SystemExit(f"ERROR: artifact escaped source root: {candidate}")
+if candidate.is_dir():
+    for child in candidate.rglob("*"):
+        if child.is_symlink():
+            raise SystemExit(f"ERROR: artifact contains a symbolic link: {child.relative_to(root)}")
+        if not child.is_dir() and not child.is_file():
+            raise SystemExit(f"ERROR: artifact contains an unsupported entry: {child.relative_to(root)}")
+PY
+    mkdir -p "$stage_dir/$(dirname -- "$relative")"
+    cp -a "$candidate" "$stage_dir/$relative"
+    artifact_count=$((artifact_count + 1))
+  done
+done
+[ "$artifact_count" -gt 0 ] || fail 'no deployment artifacts were assembled'
+mv "$stage_dir" "$release_dir"
+stage_dir=''
+
+atomic_symlink() {
+  target="$1"
+  link_path="$2"
+  python3 - "$target" "$link_path" <<'PY'
+import os
+import pathlib
+import sys
+
+target = sys.argv[1]
+link = pathlib.Path(sys.argv[2])
+temporary = link.with_name(f".{link.name}.next.{os.getpid()}")
+try:
+    temporary.unlink(missing_ok=True)
+    os.symlink(target, temporary)
+    os.replace(temporary, link)
+finally:
+    temporary.unlink(missing_ok=True)
+PY
+}
+
+current_link="$DEPLOY_ROOT/current"
+previous_target=''
+if [ -L "$current_link" ]; then
+  previous_target="$(readlink "$current_link")"
+  case "$previous_target" in releases/*) ;; *) fail 'current release link has an unsafe target' ;; esac
+fi
+
+health_check() {
+  health_body="$DEPLOY_ROOT/.health-body.$$"
+  attempt=1
+  while [ "$attempt" -le "$health_attempts" ]; do
+    health_code="$(curl -sS -o "$health_body" -w '%{http_code}' \
+      --connect-timeout 5 --max-time 15 "$HEALTH_URL" || true)"
+    case "$health_code" in 2??) find "$health_body" -delete 2>/dev/null || true; return 0 ;; esac
+    if [ "$attempt" -lt "$health_attempts" ]; then
+      sleep "$health_interval"
+    fi
+    attempt=$((attempt + 1))
+  done
+  find "$health_body" -delete 2>/dev/null || true
+  return 1
+}
+
+run_activation() {
+  command_text="$1"
+  (cd "$SOURCE_ROOT" && bash -c "$command_text")
+}
+
+restore_previous_release() {
+  failure_reason="$1"
+  rollback_status=0
+  if [ -n "$previous_target" ]; then
+    atomic_symlink "$previous_target" "$current_link"
+    CURRENT_RELEASE="$DEPLOY_ROOT/$previous_target"
+    CURRENT_LINK="$current_link"
+    PREVIOUS_RELEASE=''
+    export CURRENT_RELEASE CURRENT_LINK PREVIOUS_RELEASE
+    run_activation "$ACTIVATE_COMMAND" || rollback_status=$?
+    health_check || rollback_status=$?
+  else
+    [ ! -L "$current_link" ] || unlink "$current_link"
+  fi
+  if [ "$rollback_status" -ne 0 ]; then
+    printf 'WARNING: rollback activation or health verification also failed.\n' >&2
+  fi
+  fail "$failure_reason; previous release was restored"
+}
+
+atomic_symlink "releases/$release_id" "$current_link"
+CURRENT_RELEASE="$release_dir"
+CURRENT_LINK="$current_link"
+PREVIOUS_RELEASE="${previous_target:+$DEPLOY_ROOT/$previous_target}"
+export CURRENT_RELEASE CURRENT_LINK PREVIOUS_RELEASE
+if ! run_activation "$ACTIVATE_COMMAND"; then
+  restore_previous_release 'release activation failed'
+fi
+if ! health_check; then
+  restore_previous_release 'release health verification failed'
+fi
+
+: >"$release_dir/.successful"
+if [ -n "$previous_target" ]; then
+  previous_name="${previous_target#releases/}"
+  printf '%s\n' "$previous_name" >"$DEPLOY_ROOT/.previous-release.next.$$"
+  mv "$DEPLOY_ROOT/.previous-release.next.$$" "$DEPLOY_ROOT/.previous-release"
+else
+  previous_name=''
+  find "$DEPLOY_ROOT/.previous-release" -delete 2>/dev/null || true
+fi
+
+cleanup_successful_releases() {
+  python3 - "$RELEASES_DIR" "$release_id" "$previous_name" "$RELEASE_RETENTION" <<'PY'
+import pathlib
+import shutil
+import sys
+
+releases = pathlib.Path(sys.argv[1]).resolve()
+current = sys.argv[2]
+previous = sys.argv[3]
+retention = int(sys.argv[4])
+candidates = []
+for child in releases.iterdir():
+    if child.is_symlink() or not child.is_dir() or not (child / ".successful").is_file():
+        continue
+    candidates.append(child)
+candidates.sort(key=lambda item: (item.stat().st_mtime_ns, item.name), reverse=True)
+protected = {name for name in (current, previous) if name}
+kept = set(protected)
+for child in candidates:
+    if len(kept) >= retention:
+        break
+    kept.add(child.name)
+for child in candidates:
+    if child.name in kept:
+        continue
+    resolved = child.resolve()
+    if resolved.parent != releases:
+        raise SystemExit(f"ERROR: refusing to remove release outside root: {resolved}")
+    shutil.rmtree(resolved)
+for child in releases.iterdir():
+    if child.is_symlink():
+        raise SystemExit(f"ERROR: refusing to clean a release symlink: {child.name}")
+    if not child.is_dir() or child.name in protected:
+        continue
+    if not (child / ".jenkins-managed-release").is_file() or (child / ".successful").is_file():
+        continue
+    resolved = child.resolve()
+    if resolved.parent != releases:
+        raise SystemExit(f"ERROR: refusing to remove stale release outside root: {resolved}")
+    shutil.rmtree(resolved)
+PY
+}
+
+cleanup_successful_releases
+printf 'Deployment succeeded: environment=%s branch=%s commit=%s release=%s\n' \
+  "$DEPLOY_ENV" "$GIT_REF" "$EXPECTED_COMMIT" "$release_id"

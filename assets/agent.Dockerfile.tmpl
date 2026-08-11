@@ -1,0 +1,24 @@
+ARG NODE_IMAGE=node:__NODE_VERSION__-bookworm-slim
+ARG MAVEN_IMAGE=maven:__MAVEN_VERSION__-eclipse-temurin-21
+FROM ${NODE_IMAGE} AS node_toolchain
+FROM ${MAVEN_IMAGE} AS maven_toolchain
+
+ARG JENKINS_AGENT_IMAGE=__JENKINS_AGENT_IMAGE__
+FROM ${JENKINS_AGENT_IMAGE}
+
+USER root
+COPY --from=node_toolchain /usr/local/ /usr/local/
+COPY --from=maven_toolchain /usr/share/maven/ /usr/share/maven/
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+      ca-certificates \
+      curl \
+      git \
+      gzip \
+      openssh-client \
+      rsync \
+      tar \
+    && rm -rf /var/lib/apt/lists/*
+ENV MAVEN_HOME=/usr/share/maven
+ENV PATH=/usr/share/maven/bin:${PATH}
+USER jenkins

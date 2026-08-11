@@ -1,0 +1,262 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+umask 077
+PLANNED_JENKINS_URL=__PLANNED_JENKINS_URL__
+JENKINS_JOB=__JENKINS_JOB__
+TEST_BRANCH=__TEST_BRANCH__
+PRODUCTION_BRANCH=__PRODUCTION_BRANCH__
+
+fail() {
+  printf 'ERROR: %s\n' "$*" >&2
+  exit 2
+}
+
+usage() {
+  printf 'Usage: %s --environment test|production [--commit FULL_SHA]\n' "$(basename -- "$0")" >&2
+}
+
+environment=''
+requested_commit=''
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --environment)
+      [ "$#" -ge 2 ] || fail '--environment requires a value'
+      environment="$2"
+      shift 2
+      ;;
+    --commit)
+      [ "$#" -ge 2 ] || fail '--commit requires a value'
+      requested_commit="$2"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *) fail "unsupported argument: $1" ;;
+  esac
+done
+
+case "$environment" in
+  test) expected_branch="$TEST_BRANCH" ;;
+  production) expected_branch="$PRODUCTION_BRANCH" ;;
+  *) usage; fail '--environment must be test or production' ;;
+esac
+
+for required_command in curl git python3; do
+  command -v "$required_command" >/dev/null 2>&1 || fail "required command is unavailable: $required_command"
+done
+for variable_name in JENKINS_USER_ID JENKINS_API_TOKEN; do
+  eval "variable_value=\${${variable_name}:-}"
+  [ -n "$variable_value" ] || fail "missing required environment variable: $variable_name"
+done
+unset variable_value
+
+active_jenkins_url="${JENKINS_URL:-$PLANNED_JENKINS_URL}"
+active_jenkins_url="${active_jenkins_url%/}"
+[ "$active_jenkins_url" = "$PLANNED_JENKINS_URL" ] || \
+  fail "JENKINS_URL differs from the controller configured for this project"
+case "$active_jenkins_url" in
+  https://*|http://localhost|http://localhost/*|http://localhost:*|http://127.0.0.1|http://127.0.0.1/*|http://127.0.0.1:*|http://\[::1\]|http://\[::1\]/*|http://\[::1\]:*) ;;
+  http://*) fail 'credential-bearing Jenkins traffic requires HTTPS or a loopback SSH tunnel' ;;
+  *) fail 'configured Jenkins URL must use HTTP or HTTPS' ;;
+esac
+
+project_root="$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd -P)"
+git -C "$project_root" rev-parse --is-inside-work-tree >/dev/null 2>&1 || fail 'project root is not a Git worktree'
+[ -z "$(git -C "$project_root" status --porcelain --untracked-files=normal)" ] || \
+  fail 'working tree must be clean before deployment'
+current_branch="$(git -C "$project_root" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+[ "$current_branch" = "$expected_branch" ] || \
+  fail "$environment deployment requires the local $expected_branch branch"
+local_commit="$(git -C "$project_root" rev-parse HEAD)"
+case "$local_commit" in
+  *[!0-9a-fA-F]*|'') fail 'local HEAD is not a full commit identifier' ;;
+esac
+[ "${#local_commit}" -eq 40 ] || fail 'local HEAD is not a full 40-character commit identifier'
+if [ -n "$requested_commit" ]; then
+  case "$requested_commit" in
+    *[!0-9a-fA-F]*|'') fail '--commit must be a full 40-character commit identifier' ;;
+  esac
+  [ "${#requested_commit}" -eq 40 ] || fail '--commit must be a full 40-character commit identifier'
+  [ "$requested_commit" = "$local_commit" ] || fail '--commit differs from local HEAD'
+fi
+remote_commit="$(git -C "$project_root" ls-remote --exit-code origin "refs/heads/$expected_branch" | awk 'NR == 1 {print $1}')" || \
+  fail "origin does not contain branch $expected_branch"
+[ "$remote_commit" = "$local_commit" ] || \
+  fail "local HEAD $local_commit has not been pushed to origin/$expected_branch"
+
+timeout_seconds="${JENKINS_TRIGGER_TIMEOUT_SECONDS:-1800}"
+poll_seconds="${JENKINS_TRIGGER_POLL_SECONDS:-2}"
+case "$timeout_seconds" in ''|*[!0-9]*) fail 'JENKINS_TRIGGER_TIMEOUT_SECONDS must be an integer' ;; esac
+case "$poll_seconds" in ''|*[!0-9]*) fail 'JENKINS_TRIGGER_POLL_SECONDS must be an integer' ;; esac
+[ "$timeout_seconds" -ge 1 ] && [ "$timeout_seconds" -le 7200 ] || \
+  fail 'JENKINS_TRIGGER_TIMEOUT_SECONDS must be between 1 and 7200'
+[ "$poll_seconds" -ge 1 ] && [ "$poll_seconds" -le 60 ] || \
+  fail 'JENKINS_TRIGGER_POLL_SECONDS must be between 1 and 60'
+
+tmp_base="${TMPDIR:-/tmp}"
+private_dir="$(mktemp -d "${tmp_base%/}/jenkins-project-trigger.XXXXXX")"
+remove_private_dir() {
+  trap - EXIT HUP INT TERM
+  case "$private_dir" in
+    "${tmp_base%/}"/jenkins-project-trigger.*) find "$private_dir" -depth -delete ;;
+    *) printf 'Refusing to remove unexpected temporary path: %s\n' "$private_dir" >&2 ;;
+  esac
+  unset JENKINS_API_TOKEN
+}
+cleanup_on_exit() {
+  trigger_status=$?
+  remove_private_dir
+  exit "$trigger_status"
+}
+cleanup_on_signal() {
+  signal_status="$1"
+  remove_private_dir
+  exit "$signal_status"
+}
+trap cleanup_on_exit EXIT
+trap 'cleanup_on_signal 129' HUP
+trap 'cleanup_on_signal 130' INT
+trap 'cleanup_on_signal 143' TERM
+
+curl_config="$private_dir/curl.conf"
+export JENKINS_USER_ID JENKINS_API_TOKEN
+python3 - "$curl_config" <<'PY'
+import os
+import pathlib
+import sys
+
+def escape(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+path = pathlib.Path(sys.argv[1])
+user = os.environ["JENKINS_USER_ID"]
+token = os.environ["JENKINS_API_TOKEN"]
+if "\n" in user or "\r" in user or "\n" in token or "\r" in token:
+    raise SystemExit("ERROR: Jenkins credentials contain a newline")
+path.write_text(f'user = "{escape(user)}:{escape(token)}"\n', encoding="utf-8")
+path.chmod(0o600)
+PY
+
+validate_endpoint() {
+  candidate="$1"
+  endpoint_kind="$2"
+  python3 - "$active_jenkins_url" "$candidate" "$endpoint_kind" "$JENKINS_JOB" <<'PY'
+import re
+import sys
+from urllib.parse import urlsplit
+
+base = urlsplit(sys.argv[1])
+target = urlsplit(sys.argv[2])
+kind = sys.argv[3]
+job = sys.argv[4]
+if (target.scheme, target.netloc) != (base.scheme, base.netloc):
+    raise SystemExit("ERROR: Jenkins returned a URL on a different controller")
+if target.username or target.password or target.query or target.fragment:
+    raise SystemExit("ERROR: Jenkins returned an unsafe endpoint URL")
+base_path = base.path.rstrip("/")
+prefix = base_path + "/" if base_path else "/"
+if not target.path.startswith(prefix):
+    raise SystemExit("ERROR: Jenkins endpoint escaped the configured context path")
+relative = target.path[len(base_path):]
+patterns = {
+    "queue": r"/queue/item/[0-9]+/?",
+    "build": rf"/job/{re.escape(job)}/[0-9]+/?",
+}
+if kind not in patterns or re.fullmatch(patterns[kind], relative) is None:
+    raise SystemExit(f"ERROR: Jenkins returned an unexpected {kind} endpoint")
+PY
+}
+
+headers_file="$private_dir/trigger.headers"
+body_file="$private_dir/trigger.body"
+build_endpoint="${active_jenkins_url}/job/${JENKINS_JOB}/buildWithParameters"
+http_code="$(curl -sS --config "$curl_config" --connect-timeout 10 --max-time 30 \
+  -D "$headers_file" -o "$body_file" -w '%{http_code}' -X POST \
+  --data-urlencode "DEPLOY_ENV=$environment" \
+  --data-urlencode "GIT_REF=$expected_branch" \
+  --data-urlencode "EXPECTED_COMMIT=$local_commit" \
+  "$build_endpoint")"
+case "$http_code" in 201|202|302) ;; *) fail "Jenkins rejected the build request with HTTP $http_code" ;; esac
+
+queue_url="$(python3 - "$headers_file" "$active_jenkins_url" <<'PY'
+import pathlib
+import sys
+from urllib.parse import urljoin
+
+locations = []
+for line in pathlib.Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace").splitlines():
+    if line.lower().startswith("location:"):
+        locations.append(line.split(":", 1)[1].strip())
+if not locations:
+    raise SystemExit("ERROR: Jenkins did not return a queue Location header")
+print(urljoin(sys.argv[2].rstrip("/") + "/", locations[-1]))
+PY
+)"
+validate_endpoint "$queue_url" queue
+printf 'Jenkins accepted %s deployment of %s; waiting in queue.\n' "$environment" "$local_commit"
+
+deadline=$(( $(date +%s) + timeout_seconds ))
+queue_json="$private_dir/queue.json"
+build_url=''
+while [ "$(date +%s)" -le "$deadline" ]; do
+  curl -fsS --config "$curl_config" --connect-timeout 10 --max-time 30 \
+    "${queue_url%/}/api/json" -o "$queue_json"
+  queue_state="$(python3 - "$queue_json" <<'PY'
+import json
+import pathlib
+import sys
+
+payload = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+if payload.get("cancelled") is True:
+    print("CANCELLED")
+elif isinstance(payload.get("executable"), dict) and payload["executable"].get("url"):
+    print("READY:" + str(payload["executable"]["url"]))
+else:
+    print("WAIT")
+PY
+)"
+  case "$queue_state" in
+    CANCELLED) fail 'Jenkins cancelled the queued deployment' ;;
+    READY:*) build_url="${queue_state#READY:}"; break ;;
+    WAIT) sleep "$poll_seconds" ;;
+    *) fail 'Jenkins returned an invalid queue state' ;;
+  esac
+done
+[ -n "$build_url" ] || fail 'timed out waiting for the Jenkins build to start'
+validate_endpoint "$build_url" build
+
+build_json="$private_dir/build.json"
+build_result=''
+while [ "$(date +%s)" -le "$deadline" ]; do
+  curl -fsS --config "$curl_config" --connect-timeout 10 --max-time 30 \
+    "${build_url%/}/api/json" -o "$build_json"
+  build_state="$(python3 - "$build_json" <<'PY'
+import json
+import pathlib
+import sys
+
+payload = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+if payload.get("building") is False and payload.get("result"):
+    print("DONE:" + str(payload["result"]))
+else:
+    print("RUNNING")
+PY
+)"
+  case "$build_state" in
+    DONE:*) build_result="${build_state#DONE:}"; break ;;
+    RUNNING) sleep "$poll_seconds" ;;
+    *) fail 'Jenkins returned an invalid build state' ;;
+  esac
+done
+[ -n "$build_result" ] || fail 'timed out waiting for the Jenkins build to finish'
+
+console_file="$private_dir/console.txt"
+curl -fsS --config "$curl_config" --connect-timeout 10 --max-time 60 \
+  "${build_url%/}/consoleText" -o "$console_file"
+cat "$console_file"
+[ "$build_result" = 'SUCCESS' ] || fail "Jenkins deployment finished with result $build_result"
+printf 'Deployment succeeded: environment=%s branch=%s commit=%s\n' \
+  "$environment" "$expected_branch" "$local_commit"

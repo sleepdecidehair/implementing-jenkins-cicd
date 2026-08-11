@@ -1,0 +1,4 @@
+interface:
+  display_name: "Implementing Jenkins CI/CD"
+  short_description: "Install, configure, and run guarded Jenkins delivery"
+  default_prompt: "Use $implementing-jenkins-cicd to inspect my project, install or connect Jenkins and its matched configuration-only CLI, generate server-pull deployment assets, configure the job, and run an explicitly requested test or production deployment."

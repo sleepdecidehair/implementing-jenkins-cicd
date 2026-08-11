@@ -1,0 +1,4 @@
+ARG JENKINS_IMAGE=jenkins/jenkins:2.568.1-jdk21
+FROM ${JENKINS_IMAGE}
+COPY plugins.txt /usr/share/jenkins/ref/plugins.txt
+RUN jenkins-plugin-cli --latest=false --plugin-file /usr/share/jenkins/ref/plugins.txt
