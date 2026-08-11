@@ -268,6 +268,8 @@ The renderer produces a new private output directory containing:
 
 Rendered scripts are mode `0700`; the manifest is mode `0600`. The renderer rejects existing output paths, unknown configuration fields, nested or unsafe roots, embedded repository credentials, invalid branch mapping, and retention below two.
 
+The reusable source templates are [assets/templates/trigger-deploy.sh.tmpl](assets/templates/trigger-deploy.sh.tmpl) and [assets/templates/deploy-from-git.sh.tmpl](assets/templates/deploy-from-git.sh.tmpl). Treat rendered output as approval-bound generated material; update the templates only through a reviewed skill change and rerender every affected bundle.
+
 ### Secret-free JSON configuration
 
 Create a configuration file outside any path that would contain private values. The following complete example is illustrative: it contains no credential, key, password, or token. The schema authority is [references/server-pull-templates.md](references/server-pull-templates.md).
@@ -814,6 +816,8 @@ renderer 会生成一个新的私有输出目录，包含：
 | `manifest.json` | 渲染文件和有界控制面脚本的私有哈希 manifest 与批准标识。编辑 bundle 必须重新渲染并重新批准。 |
 
 渲染脚本权限为 `0700`，manifest 权限为 `0600`。renderer 会拒绝已有输出路径、未知配置字段、不安全或嵌套根目录、内嵌仓库凭据、无效分支映射和小于两个的保留数。
+
+可复用源模板为 [assets/templates/trigger-deploy.sh.tmpl](assets/templates/trigger-deploy.sh.tmpl) 和 [assets/templates/deploy-from-git.sh.tmpl](assets/templates/deploy-from-git.sh.tmpl)。渲染输出是受批准约束的生成材料；仅能通过经过审阅的 skill 变更更新模板，并必须重新渲染所有受影响 bundle。
 
 ### 无 secret 的 JSON 配置
 
